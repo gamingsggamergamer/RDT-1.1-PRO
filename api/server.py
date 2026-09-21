@@ -9,11 +9,14 @@ from tokenizer.tokenizer import ByteBPETokenizer
 from model.roblox_llm import RobloxLLM
 
 
+# Reduce CPU memory usage on small Render instances.
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 app = Flask(__name__)
 
-# Allow the GitHub Pages frontend to communicate with this API.
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -27,28 +30,36 @@ _tokenizer = None
 
 
 def load_model():
-    global _model, _tokenizer
+    global _model
+    global _tokenizer
 
     if _model is not None:
         return
 
-    ckpt_path = ROOT / "checkpoints" / "roblox_level2_llm.pt"
-    tok_path = ROOT / "tokenizer" / "roblox_bpe_tokenizer.json"
+    checkpoint_path = ROOT / "checkpoints" / "roblox_level2_llm.pt"
+    tokenizer_path = ROOT / "tokenizer" / "roblox_bpe_tokenizer.json"
 
-    if not ckpt_path.exists():
-        raise FileNotFoundError("Model checkpoint is missing.")
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}"
+        )
 
-    _tokenizer = ByteBPETokenizer.load(tok_path)
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found: {tokenizer_path}"
+        )
 
-    ckpt = torch.load(
-        ckpt_path,
+    _tokenizer = ByteBPETokenizer.load(tokenizer_path)
+
+    checkpoint = torch.load(
+        checkpoint_path,
         map_location="cpu"
     )
 
-    model_config = ckpt["config"]
+    model_config = checkpoint["config"]
 
     _model = RobloxLLM(
-        vocab_size=ckpt["vocab_size"],
+        vocab_size=checkpoint["vocab_size"],
         n_embd=model_config["n_embd"],
         n_heads=model_config["n_heads"],
         n_layers=model_config["n_layers"],
@@ -56,7 +67,11 @@ def load_model():
         dropout=model_config["dropout"],
     )
 
-    _model.load_state_dict(ckpt["model"])
+    _model.load_state_dict(
+        checkpoint["model"],
+        strict=True
+    )
+
     _model.eval()
 
 
@@ -76,11 +91,23 @@ def health():
     })
 
 
+@app.options("/generate")
+def generate_options():
+    return "", 204
+
+
 @app.post("/generate")
 def generate():
     body = request.get_json(silent=True) or {}
 
     prompt = body.get("prompt", "")
+
+    if not isinstance(prompt, str):
+        return jsonify({
+            "error": "prompt must be a string"
+        }), 400
+
+    prompt = prompt.strip()
 
     if not prompt:
         return jsonify({
@@ -91,36 +118,64 @@ def generate():
         load_model()
 
         config_path = ROOT / "config.json"
-        config = json.loads(config_path.read_text())
 
-        tokens = _tokenizer.encode(prompt)
+        config = json.loads(
+            config_path.read_text()
+        )
+
+        generation_config = config["generation"]
+
+        max_new_tokens = int(
+            body.get(
+                "max_new_tokens",
+                generation_config["max_new_tokens"]
+            )
+        )
+
+        temperature = float(
+            body.get(
+                "temperature",
+                generation_config["temperature"]
+            )
+        )
+
+        top_k = int(
+            body.get(
+                "top_k",
+                generation_config["top_k"]
+            )
+        )
+
+        # Prevent unnecessarily large requests from consuming
+        # excessive memory/time on the free Render instance.
+        max_new_tokens = max(
+            1,
+            min(max_new_tokens, 150)
+        )
+
+        top_k = max(
+            1,
+            min(top_k, 50)
+        )
+
+        temperature = max(
+            temperature,
+            0.01
+        )
+
+        token_ids = _tokenizer.encode(prompt)
 
         idx = torch.tensor(
-            [tokens],
+            [token_ids],
             dtype=torch.long
         )
 
-        max_new_tokens = body.get(
-            "max_new_tokens",
-            config["generation"]["max_new_tokens"]
-        )
-
-        temperature = body.get(
-            "temperature",
-            config["generation"]["temperature"]
-        )
-
-        top_k = body.get(
-            "top_k",
-            config["generation"]["top_k"]
-        )
-
-        with torch.no_grad():
+        with torch.inference_mode():
             output = _model.generate(
                 idx,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
-                top_k=top_k,
+                top_k=top_k
             )
 
         text = _tokenizer.decode(
@@ -132,6 +187,10 @@ def generate():
         })
 
     except Exception as exc:
+        app.logger.exception(
+            "Generation failed"
+        )
+
         return jsonify({
             "error": str(exc)
         }), 500
@@ -141,4 +200,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=5000
-    )
+)
