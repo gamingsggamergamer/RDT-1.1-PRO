@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Roblox LLM Level 2</title>
+</head>
+
+<body>
+    <h1>🤖 Roblox LLM Level 2</h1>
+
+    <p>Ask the Roblox AI:</p>
+
+    <textarea id="prompt" rows="5" cols="40"
+        placeholder="How do I create a RemoteEvent?"></textarea>
+
+    <br><br>
+
+    <button onclick="askAI()">Send</button>
+
+    <pre id="response"></pre>
+
+    <script>
+        async function askAI() {
+            const prompt = document.getElementById("prompt").value;
+            const responseBox = document.getElementById("response");
+
+            responseBox.textContent = "Thinking...";
+
+            try {
+                const response = await fetch(
+                    "https://testrdt-6thc.onrender.com/generate",
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({
+                            prompt: prompt,
+                            max_new_tokens: 150,
+                            temperature: 0.8,
+                            top_k: 20
+                        })
+                    }
+                );
+
+                const data = await response.json();
+
+                responseBox.textContent = data.text || "No response.";
+            } catch (error) {
+                responseBox.textContent =
+                    "Error: " + error.message;
+            }
+        }
+    </script>
+</body>
+</html>
