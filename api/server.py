@@ -9,7 +9,6 @@ from tokenizer.tokenizer import ByteBPETokenizer
 from model.roblox_llm import RobloxLLM
 
 
-# Reduce CPU memory usage on small Render instances.
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
@@ -75,7 +74,7 @@ def load_model():
     _model.eval()
 
 
-@app.get("/")
+@app.route("/", methods=["GET"])
 def root():
     return jsonify({
         "name": "Roblox LLM Level 2",
@@ -83,7 +82,7 @@ def root():
     })
 
 
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
@@ -91,12 +90,7 @@ def health():
     })
 
 
-@app.options("/generate")
-def generate_options():
-    return "", 204
-
-
-@app.post("/generate")
+@app.route("/generate", methods=["POST"])
 def generate():
     body = request.get_json(silent=True) or {}
 
@@ -146,11 +140,9 @@ def generate():
             )
         )
 
-        # Prevent unnecessarily large requests from consuming
-        # excessive memory/time on the free Render instance.
         max_new_tokens = max(
             1,
-            min(max_new_tokens, 150)
+            min(max_new_tokens, 100)
         )
 
         top_k = max(
@@ -200,4 +192,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=5000
-)
+    )
