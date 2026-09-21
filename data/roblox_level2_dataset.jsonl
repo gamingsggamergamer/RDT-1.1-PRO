@@ -1,0 +1,5 @@
+{"category":"core","content":"Roblox is a platform for creating and playing interactive experiences. Luau is the scripting language used by Roblox. Workspace contains objects that exist in the 3D world."}
+{"category":"services","content":"Players is a Roblox service that manages players. ReplicatedStorage stores objects that can be accessed by both server and clients. ServerScriptService is used for server-side scripts."}
+{"category":"luau","content":"local Players = game:GetService(\"Players\")\nPlayers.PlayerAdded:Connect(function(player)\n    print(player.Name .. \" joined the game!\")\nend)"}
+{"category":"objects","content":"A Part is a physical object in a Roblox experience. Vector3 represents a three-dimensional vector. CFrame represents position and orientation in three-dimensional space."}
+{"category":"networking","content":"A RemoteEvent is used for communication between the server and clients. Server authority should control important gameplay state such as damage, rewards, purchases and inventory."}
