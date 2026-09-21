@@ -1,0 +1,28 @@
+{
+  "model": {
+    "vocab_size": 556,
+    "n_embd": 128,
+    "n_heads": 4,
+    "n_layers": 4,
+    "block_size": 64,
+    "dropout": 0.1
+  },
+  "tokenizer": {
+    "max_merges": 300
+  },
+  "training": {
+    "batch_size": 8,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "max_steps": 1200,
+    "eval_interval": 100,
+    "eval_iters": 20,
+    "grad_clip": 1.0,
+    "val_fraction": 0.1
+  },
+  "generation": {
+    "temperature": 0.8,
+    "top_k": 20,
+    "max_new_tokens": 150
+  }
+}
