@@ -1,0 +1,11 @@
+{
+  "vocab_size": 32000,
+  "context_length": 2048,
+  "n_embd": 2048,
+  "n_layer": 19,
+  "n_head": 16,
+  "ffn_dim": 8192,
+  "dropout": 0.0,
+  "tie_embeddings": true,
+  "use_bias": true
+}

@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: rdt-1-1-pro
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn api.server:app --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 120
