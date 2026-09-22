@@ -1,41 +1,32 @@
 
 import os
 import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available()
-    else "cpu"
-)
+ROOT = Path(__file__).resolve().parent.parent
 
-ROOT = os.path.dirname(
-    os.path.dirname(
-        os.path.abspath(__file__)
-    )
-)
+HF_REPO = "mrfirex79/RDT-1.1-Pro"
+MODEL_FILENAME = "rdt_1_1_pro_level4.pt"
 
-CHECKPOINT = os.path.join(
-    ROOT,
-    "checkpoints",
-    "level4",
-    "rdt_1_1_pro_level4.pt"
-)
+CONFIG_PATH = ROOT / "rdt_1b_config.json"
+TOKENIZER_PATH = ROOT / "tokenizer" / "level4_tokenizer.json"
 
-TOKENIZER_PATH = os.path.join(
-    ROOT,
-    "tokenizer",
-    "level4_tokenizer.json"
-)
+DEVICE = torch.device("cpu")
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 
 # ============================================================
@@ -43,555 +34,444 @@ TOKENIZER_PATH = os.path.join(
 # ============================================================
 
 class CausalSelfAttention(nn.Module):
-
-    def __init__(
-        self,
-        n_embd,
-        n_head
-    ):
-
+    def __init__(self, n_embd, n_head, dropout=0.0, use_bias=True):
         super().__init__()
 
-        assert n_embd % n_head == 0
+        if n_embd % n_head != 0:
+            raise ValueError("n_embd must be divisible by n_head")
 
-        self.n_embd = n_embd
         self.n_head = n_head
         self.head_dim = n_embd // n_head
 
-        self.qkv = nn.Linear(
-            n_embd,
-            3 * n_embd
-        )
+        self.q_proj = nn.Linear(n_embd, n_embd, bias=use_bias)
+        self.k_proj = nn.Linear(n_embd, n_embd, bias=use_bias)
+        self.v_proj = nn.Linear(n_embd, n_embd, bias=use_bias)
+        self.out_proj = nn.Linear(n_embd, n_embd, bias=use_bias)
 
-        self.out_proj = nn.Linear(
-            n_embd,
-            n_embd
-        )
-
-        self.register_buffer(
-            "mask",
-            torch.tril(
-                torch.ones(
-                    2048,
-                    2048
-                )
-            ).view(
-                1,
-                1,
-                2048,
-                2048
-            ),
-            persistent=False
-        )
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        B, T, C = x.shape
 
-        b, t, c = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        qkv = self.qkv(x)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        q, k, v = qkv.chunk(
-            3,
-            dim=-1
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
         )
 
-        q = q.view(
-            b,
-            t,
-            self.n_head,
-            self.head_dim
-        ).transpose(1, 2)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        k = k.view(
-            b,
-            t,
-            self.n_head,
-            self.head_dim
-        ).transpose(1, 2)
-
-        v = v.view(
-            b,
-            t,
-            self.n_head,
-            self.head_dim
-        ).transpose(1, 2)
-
-        attention = (
-            q @ k.transpose(-2, -1)
-        ) / (
-            self.head_dim ** 0.5
-        )
-
-        attention = attention.masked_fill(
-            self.mask[
-                :,
-                :,
-                :t,
-                :t
-            ] == 0,
-            float("-inf")
-        )
-
-        attention = torch.softmax(
-            attention,
-            dim=-1
-        )
-
-        output = attention @ v
-
-        output = output.transpose(
-            1,
-            2
-        ).contiguous().view(
-            b,
-            t,
-            c
-        )
-
-        return self.out_proj(
-            output
-        )
+        return self.out_proj(y)
 
 
 class FeedForward(nn.Module):
-
-    def __init__(
-        self,
-        n_embd,
-        ffn_dim
-    ):
-
+    def __init__(self, n_embd, ffn_dim, use_bias=True):
         super().__init__()
 
-        self.fc1 = nn.Linear(
-            n_embd,
-            ffn_dim
-        )
-
-        self.fc2 = nn.Linear(
-            ffn_dim,
-            n_embd
-        )
+        self.fc1 = nn.Linear(n_embd, ffn_dim, bias=use_bias)
+        self.fc2 = nn.Linear(ffn_dim, n_embd, bias=use_bias)
 
         self.activation = nn.GELU()
 
     def forward(self, x):
-
-        return self.fc2(
-            self.activation(
-                self.fc1(x)
-            )
-        )
+        return self.fc2(self.activation(self.fc1(x)))
 
 
-class TransformerBlock(nn.Module):
-
+class RDTTransformerBlock(nn.Module):
     def __init__(
         self,
         n_embd,
         n_head,
-        ffn_dim
+        ffn_dim,
+        dropout=0.0,
+        use_bias=True,
     ):
-
         super().__init__()
 
-        self.ln1 = nn.LayerNorm(
-            n_embd
-        )
-
+        self.ln1 = nn.LayerNorm(n_embd, elementwise_affine=True)
         self.attention = CausalSelfAttention(
             n_embd,
-            n_head
+            n_head,
+            dropout,
+            use_bias,
         )
 
-        self.ln2 = nn.LayerNorm(
-            n_embd
-        )
-
-        self.ffn = FeedForward(
+        self.ln2 = nn.LayerNorm(n_embd, elementwise_affine=True)
+        self.feed_forward = FeedForward(
             n_embd,
-            ffn_dim
+            ffn_dim,
+            use_bias,
         )
 
     def forward(self, x):
-
-        x = x + self.attention(
-            self.ln1(x)
-        )
-
-        x = x + self.ffn(
-            self.ln2(x)
-        )
-
+        x = x + self.attention(self.ln1(x))
+        x = x + self.feed_forward(self.ln2(x))
         return x
 
 
 class RDT1BModel(nn.Module):
-
-    def __init__(self):
-
+    def __init__(self, config):
         super().__init__()
 
-        vocab_size = 32000
-        context_length = 2048
-        n_embd = 2048
-        n_layer = 19
-        n_head = 16
-        ffn_dim = 8192
+        architecture = config["architecture"]
+
+        vocab_size = architecture["vocab_size"]
+        context_length = architecture["context_length"]
+        n_embd = architecture["n_embd"]
+        n_layer = architecture["n_layer"]
+        n_head = architecture["n_head"]
+        ffn_dim = architecture["ffn_dim"]
+        dropout = architecture.get("dropout", 0.0)
+        use_bias = architecture.get("use_bias", True)
+        tie_embeddings = architecture.get("tie_embeddings", True)
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.n_embd = n_embd
 
         self.token_embedding = nn.Embedding(
             vocab_size,
-            n_embd
+            n_embd,
         )
 
         self.position_embedding = nn.Embedding(
             context_length,
-            n_embd
+            n_embd,
         )
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                n_embd,
-                n_head,
-                ffn_dim
-            )
-            for _ in range(n_layer)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                RDTTransformerBlock(
+                    n_embd=n_embd,
+                    n_head=n_head,
+                    ffn_dim=ffn_dim,
+                    dropout=dropout,
+                    use_bias=use_bias,
+                )
+                for _ in range(n_layer)
+            ]
+        )
 
-        self.ln_f = nn.LayerNorm(
-            n_embd
+        self.final_ln = nn.LayerNorm(
+            n_embd,
+            elementwise_affine=True,
         )
 
         self.lm_head = nn.Linear(
             n_embd,
             vocab_size,
-            bias=False
+            bias=False,
         )
 
-        self.lm_head.weight = (
-            self.token_embedding.weight
-        )
+        if tie_embeddings:
+            self.lm_head.weight = self.token_embedding.weight
 
     def forward(self, input_ids):
+        B, T = input_ids.shape
 
-        b, t = input_ids.shape
+        if T > self.context_length:
+            input_ids = input_ids[:, -self.context_length:]
+            T = input_ids.shape[1]
 
         positions = torch.arange(
-            t,
-            device=input_ids.device
+            T,
+            device=input_ids.device,
         )
 
         x = (
-            self.token_embedding(
-                input_ids
-            )
-            +
-            self.position_embedding(
-                positions
-            )
+            self.token_embedding(input_ids)
+            + self.position_embedding(positions)[None, :, :]
         )
 
         for block in self.blocks:
-
             x = block(x)
 
-        x = self.ln_f(x)
+        x = self.final_ln(x)
 
         return self.lm_head(x)
 
 
 # ============================================================
-# TOKENIZER
+# LOAD CONFIG
 # ============================================================
 
-try:
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
 
-    from tokenizers import Tokenizer
 
-    tokenizer = Tokenizer.from_file(
-        TOKENIZER_PATH
+# ============================================================
+# LOAD TOKENIZER
+# ============================================================
+
+if not TOKENIZER_PATH.exists():
+    raise FileNotFoundError(
+        f"Tokenizer not found: {TOKENIZER_PATH}"
     )
 
-    def encode_rdt(text):
-
-        return tokenizer.encode(
-            text
-        ).ids
-
-    def decode_rdt(ids):
-
-        return tokenizer.decode(
-            ids,
-            skip_special_tokens=False
-        )
-
-except Exception as error:
-
-    raise RuntimeError(
-        "Tokenizer failed to load: "
-        + str(error)
-    )
+TOKENIZER = Tokenizer.from_file(str(TOKENIZER_PATH))
 
 
-PAD_ID = tokenizer.token_to_id(
-    "<|pad|>"
+# ============================================================
+# DOWNLOAD MODEL FROM HUGGING FACE
+# ============================================================
+
+print("Downloading/loading RDT-1.1 Pro checkpoint...")
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+MODEL_PATH = hf_hub_download(
+    repo_id=HF_REPO,
+    filename=MODEL_FILENAME,
+    repo_type="model",
+    token=HF_TOKEN,
 )
 
-END_ID = tokenizer.token_to_id(
-    "<|end|>"
-)
+print(f"Checkpoint: {MODEL_PATH}")
 
 
 # ============================================================
 # LOAD MODEL
 # ============================================================
 
-model = RDT1BModel()
+model = RDT1BModel(CONFIG)
 
 checkpoint = torch.load(
-    CHECKPOINT,
+    MODEL_PATH,
     map_location="cpu",
-    weights_only=True
+    weights_only=False,
 )
+
+if isinstance(checkpoint, dict):
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+else:
+    raise RuntimeError("Unsupported checkpoint format.")
 
 model.load_state_dict(
-    checkpoint["model_state_dict"],
-    strict=True
+    state_dict,
+    strict=True,
 )
 
-model = model.to(
-    DEVICE
-)
+del checkpoint
+del state_dict
 
 model.eval()
+model.to(DEVICE)
+
+print(
+    f"RDT-1.1 Pro loaded: "
+    f"{sum(p.numel() for p in model.parameters()):,} parameters"
+)
 
 
 # ============================================================
 # GENERATION
 # ============================================================
 
-@torch.no_grad()
-def generate(
+@torch.inference_mode()
+def generate_text(
     prompt,
     max_new_tokens=80,
     temperature=0.8,
-    top_k=20
+    top_k=20,
 ):
+    encoded = TOKENIZER.encode(prompt)
 
-    ids = encode_rdt(
-        prompt
-    )
-
-    if not ids:
-        ids = [PAD_ID]
-
-    ids = ids[
-        -2047:
-    ]
-
-    tokens = torch.tensor(
-        [ids],
+    input_ids = torch.tensor(
+        [encoded.ids],
         dtype=torch.long,
-        device=DEVICE
+        device=DEVICE,
     )
 
-    for _ in range(
-        max_new_tokens
-    ):
+    max_new_tokens = min(
+        int(max_new_tokens),
+        80,
+    )
 
-        context = tokens[
+    temperature = max(
+        float(temperature),
+        0.05,
+    )
+
+    for _ in range(max_new_tokens):
+
+        idx = input_ids[
             :,
-            -2048:
+            -CONFIG["architecture"]["context_length"] :
         ]
 
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-            enabled=DEVICE.type == "cuda"
-        ):
+        logits = model(idx)
 
-            logits = model(
-                context
+        logits = logits[:, -1, :]
+
+        logits = logits / temperature
+
+        if top_k is not None:
+            k = min(
+                int(top_k),
+                logits.shape[-1],
             )
 
-        logits = logits[
-            :,
-            -1,
-            :
-        ].float()
-
-        logits = logits / max(
-            temperature,
-            1e-5
-        )
-
-        values, indices = torch.topk(
-            logits,
-            min(
-                top_k,
-                logits.shape[-1]
+            values, _ = torch.topk(
+                logits,
+                k,
             )
-        )
 
-        filtered = torch.full_like(
-            logits,
-            float("-inf")
-        )
+            cutoff = values[:, [-1]]
 
-        filtered.scatter_(
-            1,
-            indices,
-            values
-        )
+            logits = torch.where(
+                logits < cutoff,
+                torch.full_like(
+                    logits,
+                    float("-inf"),
+                ),
+                logits,
+            )
 
         probabilities = torch.softmax(
-            filtered,
-            dim=-1
+            logits,
+            dim=-1,
         )
 
         next_token = torch.multinomial(
             probabilities,
-            1
+            num_samples=1,
         )
 
-        tokens = torch.cat(
-            [
-                tokens,
-                next_token
-            ],
-            dim=1
+        input_ids = torch.cat(
+            [input_ids, next_token],
+            dim=1,
         )
 
-        if (
-            END_ID is not None
-            and int(next_token.item()) == END_ID
-        ):
-            break
+    output_ids = input_ids[0].tolist()
 
-    return decode_rdt(
-        tokens[0].tolist()
+    return TOKENIZER.decode(
+        output_ids,
+        skip_special_tokens=True,
     )
 
 
 # ============================================================
-# FLASK
+# FLASK API
 # ============================================================
 
-app = Flask(
-    __name__
-)
+app = Flask(__name__)
 
-CORS(app)
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": "*"
+        }
+    },
+)
 
 
 @app.get("/")
-def home():
-
-    return jsonify({
-        "name": "RDT-1.1 Pro",
-        "status": "online",
-        "model": "1.026B",
-        "version": "Level 4"
-    })
+def root():
+    return jsonify(
+        {
+            "name": "RDT-1.1 Pro",
+            "version": "Level 4",
+            "status": "online",
+        }
+    )
 
 
 @app.get("/health")
 def health():
-
-    return jsonify({
-        "status": "healthy",
-        "model": "RDT-1.1 Pro",
-        "parameters": 1026541568
-    })
+    return jsonify(
+        {
+            "status": "healthy",
+            "model": "RDT-1.1 Pro",
+            "parameters": sum(
+                p.numel()
+                for p in model.parameters()
+            ),
+            "device": "cpu",
+        }
+    )
 
 
 @app.post("/generate")
-def generate_endpoint():
-
+def generate():
     data = request.get_json(
         silent=True
     ) or {}
 
-    prompt = data.get(
-        "prompt",
-        ""
-    )
-
-    if not isinstance(
-        prompt,
-        str
-    ):
-
-        return jsonify({
-            "error": "prompt must be a string"
-        }), 400
-
-    if not prompt.strip():
-
-        return jsonify({
-            "error": "prompt is empty"
-        }), 400
-
-    max_new_tokens = int(
+    prompt = str(
         data.get(
-            "max_new_tokens",
-            80
+            "prompt",
+            "",
         )
+    ).strip()
+
+    if not prompt:
+        return jsonify(
+            {
+                "error": "Prompt is required."
+            }
+        ), 400
+
+    max_new_tokens = data.get(
+        "max_new_tokens",
+        80,
     )
 
-    max_new_tokens = max(
-        1,
-        min(
-            max_new_tokens,
-            100
-        )
+    temperature = data.get(
+        "temperature",
+        0.8,
     )
 
-    temperature = float(
-        data.get(
-            "temperature",
-            0.8
-        )
-    )
-
-    top_k = int(
-        data.get(
-            "top_k",
-            20
-        )
+    top_k = data.get(
+        "top_k",
+        20,
     )
 
     try:
-
-        output = generate(
-            prompt,
-            max_new_tokens,
-            temperature,
-            top_k
+        result = generate_text(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
         )
 
-        return jsonify({
-            "model": "RDT-1.1 Pro",
-            "response": output
-        })
+        return jsonify(
+            {
+                "response": result,
+                "model": "RDT-1.1 Pro",
+            }
+        )
 
-    except Exception as error:
-
-        return jsonify({
-            "error": str(error)
-        }), 500
+    except Exception as exc:
+        return jsonify(
+            {
+                "error": str(exc)
+            }
+        ), 500
 
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "8000"
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=int(
+            os.environ.get(
+                "PORT",
+                7860,
+            )
+        ),
     )
